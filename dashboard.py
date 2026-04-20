@@ -184,6 +184,174 @@ def _gap_cards(gaps: list[str]) -> str:
     return '<div class="gap-grid">' + "".join(cards) + "</div>"
 
 
+def _price_intelligence_table(brands: list[dict], categories: list[str]) -> str:
+    """Per-brand per-category table showing avg original → avg sale → savings."""
+    # Filter to brands/categories that actually have price data
+    cats_with_data = []
+    for cat in categories:
+        for b in brands:
+            for c in b.get("category_discounts", []):
+                if c.get("category", "").strip() == cat and (
+                    c.get("avg_original_price") or c.get("price_examples")
+                ):
+                    if cat not in cats_with_data:
+                        cats_with_data.append(cat)
+                    break
+
+    if not cats_with_data:
+        return '<p style="color:#888;font-size:13px;">No product price data was collected for this run.</p>'
+
+    header_cells = ['<th class="corner">Category</th>']
+    for b in brands:
+        cls = ' class="ours-col"' if b.get("is_ours") else ""
+        header_cells.append(f'<th{cls}>{_e(b["name"])}</th>')
+
+    rows = []
+    for cat in cats_with_data:
+        cells = [f'<td class="cat-label">{_e(cat)}</td>']
+        for b in brands:
+            cat_data = next(
+                (c for c in b.get("category_discounts", [])
+                 if c.get("category", "").strip() == cat),
+                {},
+            )
+            avg_o = cat_data.get("avg_original_price")
+            avg_s = cat_data.get("avg_sale_price")
+            examples = cat_data.get("price_examples", [])
+
+            if not avg_o and examples:
+                avg_o = round(sum(p["original_price"] for p in examples) / len(examples), 2)
+                avg_s = round(sum(p["sale_price"] for p in examples) / len(examples), 2)
+
+            is_ours = b.get("is_ours", False)
+            bg = "#EBF0FB" if is_ours else "#FAFBFC"
+            border = "border-left:3px solid #1B3A6B;" if is_ours else ""
+            if avg_o and avg_s:
+                savings = round(avg_o - avg_s, 2)
+                pct = round((avg_o - avg_s) / avg_o * 100)
+                color = "#E8365D" if pct >= 20 else ("#E65100" if pct >= 10 else "#2E7D32")
+                cell = (
+                    f'<td style="background:{bg};{border}text-align:center;vertical-align:top;">'
+                    f'<span style="display:block;font-size:11px;color:#888;">orig</span>'
+                    f'<span style="font-weight:700;">${avg_o:.2f}</span>'
+                    f'<span style="display:block;font-size:11px;color:#888;margin-top:4px;">sale</span>'
+                    f'<span style="font-weight:700;color:{color};">${avg_s:.2f}</span>'
+                    f'<span style="display:block;font-size:10px;color:{color};margin-top:3px;">'
+                    f'−${savings:.2f} ({pct}% off)</span>'
+                    f'</td>'
+                )
+            else:
+                cell = f'<td style="background:{bg};{border}color:#CCC;text-align:center;">—</td>'
+            cells.append(cell)
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    return f"""
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr>{"".join(header_cells)}</tr></thead>
+        <tbody>{"".join(rows)}</tbody>
+      </table>
+    </div>"""
+
+
+def _winners_losers_cards(brands: list[dict], our_name: str) -> str:
+    """Top deals across all brands (winners) and where VV falls behind (losers)."""
+    all_examples: list[dict] = []
+    for b in brands:
+        for c in b.get("category_discounts", []):
+            for ex in c.get("price_examples", []):
+                all_examples.append({
+                    **ex,
+                    "brand": b["name"],
+                    "category": c.get("category", ""),
+                    "is_ours": b.get("is_ours", False),
+                })
+
+    if not all_examples:
+        return '<p style="color:#888;font-size:13px;">No price examples collected — run with price scraping enabled.</p>'
+
+    # Top 5 deepest discounts across all brands
+    top_deals = sorted(all_examples, key=lambda x: x.get("discount_pct", 0), reverse=True)[:5]
+
+    # VV categories where a competitor has a deeper avg discount
+    our_brand = next((b for b in brands if b.get("is_ours")), None)
+    loser_rows = []
+    if our_brand:
+        our_cats = {
+            c.get("category", "").strip(): c
+            for c in our_brand.get("category_discounts", [])
+        }
+        for cat, our_cat in our_cats.items():
+            our_avg_s = our_cat.get("avg_sale_price")
+            our_avg_o = our_cat.get("avg_original_price")
+            our_pct = our_cat.get("max_discount_pct", 0)
+            for b in brands:
+                if b.get("is_ours"):
+                    continue
+                comp_cat = next(
+                    (c for c in b.get("category_discounts", [])
+                     if c.get("category", "").strip() == cat),
+                    None,
+                )
+                if not comp_cat:
+                    continue
+                comp_pct = comp_cat.get("max_discount_pct", 0)
+                if comp_pct - our_pct >= 10:
+                    loser_rows.append({
+                        "category": cat,
+                        "competitor": b["name"],
+                        "comp_pct": comp_pct,
+                        "our_pct": our_pct,
+                        "gap": comp_pct - our_pct,
+                    })
+    loser_rows.sort(key=lambda x: x["gap"], reverse=True)
+    loser_rows = loser_rows[:5]
+
+    # Build winners HTML
+    winner_cards = []
+    for deal in top_deals:
+        label = "⭐ " if deal["is_ours"] else ""
+        winner_cards.append(f"""
+        <div class="gap-card" style="border-left-color:#27AE60;">
+          <div class="gap-num" style="color:#27AE60;">{label}{_e(deal["brand"])} — {_e(deal["category"])}</div>
+          <p style="font-size:13px;font-weight:700;color:#27AE60;">{deal["discount_pct"]}% off</p>
+          <p>{_e(deal.get("product_name",""))}<br>
+          <span style="font-size:11px;color:#888;">${deal["original_price"]:.2f} → ${deal["sale_price"]:.2f}</span></p>
+        </div>""")
+
+    # Build losers HTML
+    loser_cards = []
+    for row in loser_rows:
+        loser_cards.append(f"""
+        <div class="gap-card">
+          <div class="gap-num">{_e(our_name)} vs {_e(row["competitor"])} — {_e(row["category"])}</div>
+          <p><strong>{_e(our_name)}:</strong> {row["our_pct"]}% max off<br>
+          <strong>{_e(row["competitor"])}:</strong> {row["comp_pct"]}% max off<br>
+          <span style="color:#C62828;font-weight:600;">Gap: {row["gap"]} percentage points</span></p>
+        </div>""")
+
+    winners_html = (
+        '<div class="gap-grid">' + "".join(winner_cards) + "</div>"
+        if winner_cards else
+        '<p style="color:#888;font-size:13px;">No top deal examples found.</p>'
+    )
+    losers_html = (
+        '<div class="gap-grid">' + "".join(loser_cards) + "</div>"
+        if loser_cards else
+        f'<p style="color:#27AE60;font-size:13px;">No significant discount gaps found — {_e(our_name)} is competitive!</p>'
+    )
+
+    return f"""
+    <h3 style="font-size:13px;font-weight:700;color:#27AE60;margin-bottom:10px;">
+      🏆 Biggest Deals (Best Discounts for Shoppers)
+    </h3>
+    {winners_html}
+    <h3 style="font-size:13px;font-weight:700;color:#E74C3C;margin-top:20px;margin-bottom:10px;">
+      ⚠️ Where {_e(our_name)} Falls Behind
+    </h3>
+    {losers_html}"""
+
+
 def _rec_list(recs: list[str]) -> str:
     if not recs:
         return ""
@@ -342,6 +510,16 @@ def generate_html(data: dict) -> str:
     <div class="section">
       <h2>Site-Wide &amp; Promotional Offers</h2>
       {_sitewide_table(brands)}
+    </div>
+
+    <div class="section">
+      <h2>Price Intelligence — Before &amp; After Discounts</h2>
+      {_price_intelligence_table(brands, all_cats)}
+    </div>
+
+    <div class="section">
+      <h2>Biggest Deals &amp; Biggest Losers</h2>
+      {_winners_losers_cards(brands, our_name)}
     </div>
 
     <div class="section">

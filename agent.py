@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import textwrap
 import webbrowser
@@ -142,6 +143,161 @@ def find_discount_links(base_url: str) -> dict:
     return {"base_url": base_url, "discount_links": unique}
 
 
+def _parse_price(text: str) -> float | None:
+    """Extract a dollar amount from strings like '$89.50', '$ 99', '1,299.00'."""
+    m = re.search(r"\$\s*([\d,]+(?:\.\d{1,2})?)", text)
+    if m:
+        return float(m.group(1).replace(",", ""))
+    return None
+
+
+def _extract_jsonld_product(item: dict, products: list, seen_pairs: set) -> None:
+    name = item.get("name", "")[:80]
+    offers = item.get("offers", {})
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+    price = offers.get("price")
+    try:
+        sale = float(price) if price is not None else None
+    except (ValueError, TypeError):
+        sale = None
+    high = offers.get("highPrice")
+    try:
+        orig = float(high) if high is not None else None
+    except (ValueError, TypeError):
+        orig = None
+    if sale and orig and orig > sale:
+        pair = (round(orig, 2), round(sale, 2))
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            disc = round((orig - sale) / orig * 100)
+            products.append({
+                "product_name": name,
+                "original_price": orig,
+                "sale_price": sale,
+                "discount_pct": disc,
+            })
+
+
+def scrape_product_prices(url: str) -> dict:
+    """Scrape a product listing or sale page to extract before/after price pairs."""
+    resp = _fetch(url)
+    if resp is None:
+        return {"url": url, "status": "error", "error": "Request failed or timed out"}
+
+    soup = BeautifulSoup(resp.content, "lxml")
+    products: list[dict] = []
+    seen_pairs: set[tuple] = set()
+
+    # 1) JSON-LD structured data
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        i = 0
+        while i < len(items):
+            item = items[i]
+            i += 1
+            if "@graph" in item:
+                items.extend(item["@graph"])
+            t = item.get("@type", "")
+            if t == "Product":
+                _extract_jsonld_product(item, products, seen_pairs)
+            elif t == "ItemList":
+                for elem in item.get("itemListElement", []):
+                    prod = elem.get("item", elem)
+                    if prod.get("@type") == "Product":
+                        _extract_jsonld_product(prod, products, seen_pairs)
+
+    # 2) HTML strikethrough patterns (<del>, <s>)
+    for del_tag in soup.find_all(["del", "s"]):
+        orig = _parse_price(del_tag.get_text(strip=True))
+        if orig is None:
+            continue
+        sale = None
+        for sib in del_tag.find_next_siblings()[:3]:
+            sale = _parse_price(sib.get_text(strip=True))
+            if sale:
+                break
+        if not sale and del_tag.parent:
+            for sib in del_tag.parent.find_next_siblings()[:2]:
+                sale = _parse_price(sib.get_text(strip=True))
+                if sale:
+                    break
+        if sale and sale < orig:
+            pair = (round(orig, 2), round(sale, 2))
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                prev = del_tag.find_previous(["h1", "h2", "h3", "h4", "a"])
+                name = prev.get_text(strip=True)[:80] if prev else ""
+                disc = round((orig - sale) / orig * 100)
+                products.append({
+                    "product_name": name,
+                    "original_price": orig,
+                    "sale_price": sale,
+                    "discount_pct": disc,
+                })
+
+    # 3) CSS class heuristics (was-price / now-price patterns)
+    was_tokens = ["was", "original-price", "regular-price", "price-was",
+                  "compare-at-price", "old-price", "before"]
+    now_tokens = ["now", "sale-price", "current-price", "price-now",
+                  "price-sale", "after", "special"]
+    for was_el in soup.find_all(class_=True):
+        classes = " ".join(was_el.get("class", [])).lower()
+        if not any(t in classes for t in was_tokens):
+            continue
+        orig = _parse_price(was_el.get_text(strip=True))
+        if orig is None:
+            continue
+        parent = was_el.parent or was_el
+        sale = None
+        for now_el in parent.find_all(class_=True):
+            nc = " ".join(now_el.get("class", [])).lower()
+            if any(t in nc for t in now_tokens):
+                sale = _parse_price(now_el.get_text(strip=True))
+                if sale:
+                    break
+        if sale and sale < orig:
+            pair = (round(orig, 2), round(sale, 2))
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                prev = was_el.find_previous(["h1", "h2", "h3", "h4", "a"])
+                name = prev.get_text(strip=True)[:80] if prev else ""
+                disc = round((orig - sale) / orig * 100)
+                products.append({
+                    "product_name": name,
+                    "original_price": orig,
+                    "sale_price": sale,
+                    "discount_pct": disc,
+                })
+
+    products = products[:20]
+
+    if products:
+        avg_orig = round(sum(p["original_price"] for p in products) / len(products), 2)
+        avg_sale = round(sum(p["sale_price"] for p in products) / len(products), 2)
+        price_range = {
+            "min_sale": min(p["sale_price"] for p in products),
+            "max_original": max(p["original_price"] for p in products),
+        }
+    else:
+        avg_orig = None
+        avg_sale = None
+        price_range = None
+
+    return {
+        "url": url,
+        "status": "success",
+        "products": products,
+        "avg_original_price": avg_orig,
+        "avg_sale_price": avg_sale,
+        "price_range": price_range,
+    }
+
+
 # ── Tool registry ──────────────────────────────────────────────────────────────
 
 # JSON schema for the category_discounts items used inside generate_dashboard
@@ -164,8 +320,33 @@ _CATEGORY_DISCOUNT_SCHEMA = {
             "items": {"type": "string"},
             "description": "Exact offer strings found for this category",
         },
+        "price_examples": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "product_name": {"type": "string"},
+                    "original_price": {"type": "number"},
+                    "sale_price": {"type": "number"},
+                    "discount_pct": {"type": "integer"},
+                },
+                "required": ["product_name", "original_price", "sale_price", "discount_pct"],
+            },
+            "description": "Up to 5 price examples from scrape_product_prices for this category",
+        },
+        "avg_original_price": {
+            "type": ["number", "null"],
+            "description": "Average original price across sampled products, or null if no data",
+        },
+        "avg_sale_price": {
+            "type": ["number", "null"],
+            "description": "Average sale price across sampled products, or null if no data",
+        },
     },
-    "required": ["category", "max_discount_pct", "active_offers"],
+    "required": [
+        "category", "max_discount_pct", "active_offers",
+        "price_examples", "avg_original_price", "avg_sale_price",
+    ],
 }
 
 _SITE_WIDE_SCHEMA = {
@@ -224,6 +405,27 @@ TOOLS: list[dict] = [
                 },
             },
             "required": ["base_url"],
+        },
+    },
+    {
+        "name": "scrape_product_prices",
+        "description": (
+            "Scrape a product listing, category, or sale page to extract actual "
+            "before-and-after price pairs. Uses JSON-LD structured data, HTML "
+            "strikethrough (<del>/<s>) patterns, and CSS class heuristics. "
+            "Returns up to 20 product samples with avg_original_price and "
+            "avg_sale_price aggregates. Call this on sale/clearance and category "
+            "pages to populate price_examples in generate_dashboard."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Full URL of a product listing, category, or sale page",
+                },
+            },
+            "required": ["url"],
         },
     },
     {
@@ -298,6 +500,8 @@ def _dispatch_tool(name: str, tool_input: dict) -> str:
         return json.dumps(scrape_url(tool_input["url"]), ensure_ascii=False)
     if name == "find_discount_links":
         return json.dumps(find_discount_links(tool_input["base_url"]), ensure_ascii=False)
+    if name == "scrape_product_prices":
+        return json.dumps(scrape_product_prices(tool_input["url"]), ensure_ascii=False)
     if name == "generate_dashboard":
         _dashboard_data = tool_input
         return json.dumps({"status": "ok", "message": "Dashboard data received."})
@@ -319,6 +523,9 @@ SYSTEM_PROMPT = textwrap.dedent("""
       1. Call find_discount_links(base_url) to discover sale/promo/pricing pages.
       2. Call scrape_url on the homepage.
       3. Call scrape_url on each URL returned by find_discount_links.
+      4. For sale, clearance, and category pages found above, ALSO call
+         scrape_product_prices(url) to extract actual before/after price pairs.
+         Aim for 1-3 price scrapes per site, prioritising sale/clearance URLs.
 
     ── WHAT TO EXTRACT PER SITE ─────────────────────────────────────────────
     Category-level discounts (fill category_discounts for each brand):
@@ -328,6 +535,10 @@ SYSTEM_PROMPT = textwrap.dedent("""
     For each category record:
       - max_discount_pct: the highest % off you found (0 if none)
       - active_offers: exact strings, e.g. "Extra 40% off sale styles"
+      - price_examples: up to 5 items from scrape_product_prices that belong to
+        this category (use [] if no price data available for the category)
+      - avg_original_price: average original price from price_examples, or null
+      - avg_sale_price: average sale price from price_examples, or null
 
     Site-wide offers (fill site_wide for each brand):
       - email_signup: discount for joining the mailing list
@@ -338,14 +549,16 @@ SYSTEM_PROMPT = textwrap.dedent("""
     ── FINAL STEP ───────────────────────────────────────────────────────────
     After ALL sites are scraped, call generate_dashboard exactly once with:
       - brands: full structured data for every brand
-      - analysis_summary: 2-4 sentence narrative
-      - gaps: specific gaps where competitors beat VV (name brand + category + offer)
+      - analysis_summary: 2-4 sentence narrative including price observations
+      - gaps: specific gaps where competitors beat VV (name brand + category +
+        offer + price difference where data exists)
       - recommendations: concrete actions VV should take
 
     Rules:
-    • Only report offers you literally read on the pages — do not fabricate.
+    • Only report offers and prices you literally read on the pages — do not fabricate.
     • If a page fails to load, skip it and continue.
     • Cover all brands before calling generate_dashboard.
+    • price_examples must always be present (use [] if no price data found).
 """).strip()
 
 
@@ -435,6 +648,14 @@ def run_agent(
                 if "discount_links" in result_obj:
                     n = len(result_obj["discount_links"])
                     print(f"  → found {n} discount link(s)")
+                elif tu.name == "scrape_product_prices":
+                    n = len(result_obj.get("products", []))
+                    avg_o = result_obj.get("avg_original_price")
+                    avg_s = result_obj.get("avg_sale_price")
+                    price_info = (
+                        f"  avg ${avg_o:.2f} → ${avg_s:.2f}" if avg_o and avg_s else ""
+                    )
+                    print(f"  → found {n} price pair(s){price_info}")
                 elif tu.name == "generate_dashboard":
                     print("  → structured data received, dashboard queued")
                 elif result_obj.get("status") == "error":
