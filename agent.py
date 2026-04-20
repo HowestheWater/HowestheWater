@@ -1,8 +1,8 @@
 """
 Competitor Discount Agent for Vineyard Vines.
 
-Scrapes competitor sites and our own site to compare discount offerings,
-then generates an actionable gap analysis report.
+Scrapes competitor and our own site to compare discounts by category,
+then renders a self-contained HTML dashboard report.
 
 Usage:
     pip install -r requirements.txt
@@ -10,9 +10,9 @@ Usage:
     python agent.py
 
     # Override sites at runtime:
-    python agent.py --our-url https://howesthewater.com \
-                    --competitor "CompA|https://compa.com" \
-                    --competitor "CompB|https://compb.com"
+    python agent.py --our-url https://vineyardvines.com \\
+                    --competitor "J.Crew|https://www.jcrew.com" \\
+                    --competitor "Lululemon|https://www.lululemon.com"
 """
 
 import argparse
@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import textwrap
+import webbrowser
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -29,6 +30,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 import config as cfg
+import dashboard as dash
 
 load_dotenv()
 
@@ -94,7 +96,6 @@ def find_discount_links(base_url: str) -> dict:
     found: list[str] = []
     checked_urls = {base_url.rstrip("/")}
 
-    # Pages to inspect for internal links
     candidates = [base_url, urljoin(base_url, "/sitemap.xml")]
 
     for start in candidates:
@@ -104,7 +105,6 @@ def find_discount_links(base_url: str) -> dict:
 
         content_type = resp.headers.get("content-type", "")
         if "xml" in content_type:
-            # Parse sitemap
             soup = BeautifulSoup(resp.content, "lxml-xml")
             locs = [tag.get_text(strip=True) for tag in soup.find_all("loc")]
             for loc in locs:
@@ -114,7 +114,6 @@ def find_discount_links(base_url: str) -> dict:
                         checked_urls.add(normalized)
                         found.append(loc)
         else:
-            # Parse HTML for anchor tags
             soup = BeautifulSoup(resp.content, "lxml")
             base_domain = urlparse(base_url).netloc
             for a in soup.find_all("a", href=True):
@@ -131,7 +130,6 @@ def find_discount_links(base_url: str) -> dict:
                         checked_urls.add(full)
                         found.append(full)
 
-    # De-duplicate, keep first 8
     seen: set[str] = set()
     unique: list[str] = []
     for url in found:
@@ -145,6 +143,54 @@ def find_discount_links(base_url: str) -> dict:
 
 
 # ── Tool registry ──────────────────────────────────────────────────────────────
+
+# JSON schema for the category_discounts items used inside generate_dashboard
+_CATEGORY_DISCOUNT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "description": (
+                "Category name, e.g. Men's, Women's, Kids, Boys, Girls, "
+                "Accessories, Footwear, Home & Gifts, Sale / Clearance"
+            ),
+        },
+        "max_discount_pct": {
+            "type": "integer",
+            "description": "Highest discount percentage found in this category (0 if none)",
+        },
+        "active_offers": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Exact offer strings found for this category",
+        },
+    },
+    "required": ["category", "max_discount_pct", "active_offers"],
+}
+
+_SITE_WIDE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "email_signup": {
+            "type": ["string", "null"],
+            "description": "Email sign-up discount offer, e.g. '15% off first order' or null",
+        },
+        "free_shipping": {
+            "type": ["string", "null"],
+            "description": "Free shipping offer, e.g. 'Free on orders $125+' or null",
+        },
+        "loyalty_program": {
+            "type": ["string", "null"],
+            "description": "Loyalty / rewards program name or description, or null",
+        },
+        "promo_codes": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Any promo codes visibly displayed on the site",
+        },
+    },
+    "required": ["email_signup", "free_shipping", "loyalty_program", "promo_codes"],
+}
 
 TOOLS: list[dict] = [
     {
@@ -180,58 +226,136 @@ TOOLS: list[dict] = [
             "required": ["base_url"],
         },
     },
+    {
+        "name": "generate_dashboard",
+        "description": (
+            "Call this ONCE at the very end after scraping all sites. "
+            "Provide the fully structured discount data you collected. "
+            "This will render the HTML dashboard and save the report."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brands": {
+                    "type": "array",
+                    "description": "One entry per brand, including Vineyard Vines (is_ours=true)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "url": {"type": "string"},
+                            "is_ours": {
+                                "type": "boolean",
+                                "description": "true only for Vineyard Vines",
+                            },
+                            "category_discounts": {
+                                "type": "array",
+                                "items": _CATEGORY_DISCOUNT_SCHEMA,
+                                "description": (
+                                    "One entry per clothing/product category found. "
+                                    "Always include Men's, Women's, Kids if the site has them. "
+                                    "Also include Accessories, Footwear, Sale/Clearance, etc. if present."
+                                ),
+                            },
+                            "site_wide": _SITE_WIDE_SCHEMA,
+                        },
+                        "required": ["name", "url", "is_ours", "category_discounts", "site_wide"],
+                    },
+                },
+                "analysis_summary": {
+                    "type": "string",
+                    "description": "2-4 sentence narrative summary of the overall competitive picture",
+                },
+                "gaps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Each gap where a competitor outperforms Vineyard Vines. "
+                        "Be specific — name the competitor, the category, and the offer difference."
+                    ),
+                },
+                "recommendations": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Concrete, actionable steps Vineyard Vines should take to close gaps",
+                },
+            },
+            "required": ["brands", "analysis_summary", "gaps", "recommendations"],
+        },
+    },
 ]
 
 
+# ── Tool dispatch ──────────────────────────────────────────────────────────────
+
+# Holds the structured data Claude passes to generate_dashboard
+_dashboard_data: dict | None = None
+
+
 def _dispatch_tool(name: str, tool_input: dict) -> str:
+    global _dashboard_data
     if name == "scrape_url":
         return json.dumps(scrape_url(tool_input["url"]), ensure_ascii=False)
     if name == "find_discount_links":
         return json.dumps(find_discount_links(tool_input["base_url"]), ensure_ascii=False)
+    if name == "generate_dashboard":
+        _dashboard_data = tool_input
+        return json.dumps({"status": "ok", "message": "Dashboard data received."})
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
-# ── Agent ──────────────────────────────────────────────────────────────────────
+# ── System prompt ──────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = textwrap.dedent("""
     You are a competitive-intelligence analyst for Vineyard Vines, a premium
     preppy lifestyle and apparel brand (vineyardvines.com).
 
-    Your goal is to compare discounts and promotional offers between Vineyard Vines
-    and its direct competitors (J.Crew, Lululemon, Bird Dog, Ralph Lauren, etc.).
+    Your goal is to scrape Vineyard Vines and its listed competitors, extract
+    all discount and promotional offers broken down by clothing/product category,
+    then call generate_dashboard with the structured findings.
 
-    Process:
-    1. For each site (Vineyard Vines first, then competitors), call
-       find_discount_links to discover promotion, sale, or pricing pages.
-    2. Call scrape_url on the homepage AND each discovered discount page.
-    3. Extract every concrete discount or promotional offer you find:
-       - Percentage discounts (e.g. "20% off first order", "extra 30% off sale")
-       - Dollar-off amounts (e.g. "$20 off $100")
-       - Welcome / new-customer offers
-       - Email sign-up incentives
-       - Loyalty or rewards programs
-       - Referral bonuses
-       - Seasonal / holiday / flash sales
-       - Clearance or final-sale sections
-       - Free shipping thresholds or offers
-       - Gift-with-purchase deals
-       - Promo codes prominently displayed
-    4. After gathering all data, write a clear, structured report with:
-       a. Summary table: brand vs. offer types found (use ✓ / ✗)
-       b. Detailed breakdown per brand with exact offer wording
-       c. Gap analysis — what competitors do that Vineyard Vines does not
-       d. Actionable recommendations for Vineyard Vines
+    ── SCRAPING PROCESS ──────────────────────────────────────────────────────
+    For each site (Vineyard Vines first, then competitors in order):
+      1. Call find_discount_links(base_url) to discover sale/promo/pricing pages.
+      2. Call scrape_url on the homepage.
+      3. Call scrape_url on each URL returned by find_discount_links.
 
-    Be thorough — scrape every relevant page you find.
-    If a page fails to load, note it and continue with the rest.
-    Do NOT fabricate offers; only report what you actually read from the pages.
+    ── WHAT TO EXTRACT PER SITE ─────────────────────────────────────────────
+    Category-level discounts (fill category_discounts for each brand):
+      • Men's       • Women's     • Kids / Boys / Girls
+      • Accessories • Footwear    • Home & Gifts
+      • Sale / Clearance
+    For each category record:
+      - max_discount_pct: the highest % off you found (0 if none)
+      - active_offers: exact strings, e.g. "Extra 40% off sale styles"
+
+    Site-wide offers (fill site_wide for each brand):
+      - email_signup: discount for joining the mailing list
+      - free_shipping: threshold or always-free policy
+      - loyalty_program: rewards program name/description
+      - promo_codes: any codes visibly shown on the page
+
+    ── FINAL STEP ───────────────────────────────────────────────────────────
+    After ALL sites are scraped, call generate_dashboard exactly once with:
+      - brands: full structured data for every brand
+      - analysis_summary: 2-4 sentence narrative
+      - gaps: specific gaps where competitors beat VV (name brand + category + offer)
+      - recommendations: concrete actions VV should take
+
+    Rules:
+    • Only report offers you literally read on the pages — do not fabricate.
+    • If a page fails to load, skip it and continue.
+    • Cover all brands before calling generate_dashboard.
 """).strip()
+
+
+# ── Agent loop ─────────────────────────────────────────────────────────────────
 
 
 def build_initial_message(our_site: dict, competitors: list[dict]) -> str:
     lines = [
-        "Analyze discount offerings for the following websites:\n",
-        f"**Our site:** {our_site['name']}  —  {our_site['base_url']}",
+        "Analyze discounts and promotions for the following websites:\n",
+        f"**Our brand:** {our_site['name']}  —  {our_site['base_url']}",
         "",
         "**Competitors:**",
     ]
@@ -239,13 +363,21 @@ def build_initial_message(our_site: dict, competitors: list[dict]) -> str:
         lines.append(f"- {c['name']}  —  {c['base_url']}")
     lines += [
         "",
-        "Start by finding discount pages on each site, scrape them, then produce "
-        "a comprehensive gap-analysis report.",
+        "Scrape every site, extract category-level discount data, then call "
+        "generate_dashboard with the fully structured findings to produce the dashboard.",
     ]
     return "\n".join(lines)
 
 
-def run_agent(our_site: dict, competitors: list[dict], save_report: bool = True) -> str:
+def run_agent(
+    our_site: dict,
+    competitors: list[dict],
+    save_report: bool = True,
+    open_browser: bool = True,
+) -> str:
+    global _dashboard_data
+    _dashboard_data = None
+
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         sys.exit("Error: ANTHROPIC_API_KEY environment variable not set.")
@@ -256,12 +388,11 @@ def run_agent(our_site: dict, competitors: list[dict], save_report: bool = True)
     ]
 
     print("━" * 64)
-    print(" Vineyard Vines — Competitor Discount Agent")
+    print(" Vineyard Vines — Competitor Discount Intelligence")
     print("━" * 64)
 
-    final_text = ""
     iteration = 0
-    max_iterations = 30  # guard against runaway loops
+    max_iterations = 40
 
     while iteration < max_iterations:
         iteration += 1
@@ -275,14 +406,12 @@ def run_agent(our_site: dict, competitors: list[dict], save_report: bool = True)
             messages=messages,
         )
 
-        # Collect tool-use blocks and any text
         tool_use_blocks = []
         for block in response.content:
             if block.type == "thinking":
-                pass  # internal reasoning; not printed
+                pass
             elif block.type == "text" and block.text.strip():
                 print(block.text)
-                final_text = block.text
             elif block.type == "tool_use":
                 tool_use_blocks.append(block)
 
@@ -293,22 +422,21 @@ def run_agent(our_site: dict, competitors: list[dict], save_report: bool = True)
             print(f"[agent] Unexpected stop_reason: {response.stop_reason}")
             break
 
-        # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
 
-        # Execute tools
         tool_results = []
         for tu in tool_use_blocks:
-            label = tu.input.get("url") or tu.input.get("base_url") or ""
+            label = tu.input.get("url") or tu.input.get("base_url") or tu.name
             print(f"\n[{tu.name}] {label}")
             result_str = _dispatch_tool(tu.name, tu.input)
 
-            # Print a brief preview
             try:
                 result_obj = json.loads(result_str)
                 if "discount_links" in result_obj:
-                    links = result_obj["discount_links"]
-                    print(f"  → found {len(links)} discount link(s)")
+                    n = len(result_obj["discount_links"])
+                    print(f"  → found {n} discount link(s)")
+                elif tu.name == "generate_dashboard":
+                    print("  → structured data received, dashboard queued")
                 elif result_obj.get("status") == "error":
                     print(f"  → error: {result_obj.get('error')}")
                 else:
@@ -325,23 +453,38 @@ def run_agent(our_site: dict, competitors: list[dict], save_report: bool = True)
 
         messages.append({"role": "user", "content": tool_results})
 
+        # If generate_dashboard was just called, we can let the loop finish naturally
+        if _dashboard_data is not None and response.stop_reason == "tool_use":
+            # Append the tool result and do one more turn so Claude can say goodbye,
+            # but we already have what we need — let the loop continue normally.
+            pass
+
     print("\n" + "━" * 64)
 
-    if save_report and final_text:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = f"discount_report_{timestamp}.txt"
-        with open(report_path, "w", encoding="utf-8") as fh:
-            fh.write(final_text)
-        print(f"Report saved → {report_path}")
-
-    return final_text
+    report_path = ""
+    if _dashboard_data:
+        html_content = dash.generate_html(_dashboard_data)
+        if save_report:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = f"discount_dashboard_{timestamp}.html"
+            with open(report_path, "w", encoding="utf-8") as fh:
+                fh.write(html_content)
+            print(f"\n✅  Dashboard saved → {report_path}")
+            if open_browser:
+                abs_path = os.path.abspath(report_path)
+                webbrowser.open(f"file://{abs_path}")
+        return html_content
+    else:
+        print("\n⚠️  generate_dashboard was never called — no structured data captured.")
+        return ""
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Vineyard Vines competitor discount agent"
+        description="Vineyard Vines competitor discount intelligence dashboard"
     )
     parser.add_argument(
         "--our-url",
@@ -362,7 +505,12 @@ def main():
     parser.add_argument(
         "--no-save",
         action="store_true",
-        help="Do not save the report to a file",
+        help="Do not save the HTML report to a file",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not auto-open the dashboard in a browser",
     )
     args = parser.parse_args()
 
@@ -378,7 +526,12 @@ def main():
     else:
         competitors = cfg.COMPETITOR_SITES
 
-    run_agent(our_site, competitors, save_report=not args.no_save)
+    run_agent(
+        our_site,
+        competitors,
+        save_report=not args.no_save,
+        open_browser=not args.no_browser,
+    )
 
 
 if __name__ == "__main__":
