@@ -1,5 +1,5 @@
 """
-Competitor Discount Agent for HowestheWater.
+Competitor Discount Agent for Vineyard Vines.
 
 Scrapes competitor sites and our own site to compare discount offerings,
 then generates an actionable gap analysis report.
@@ -194,32 +194,36 @@ def _dispatch_tool(name: str, tool_input: dict) -> str:
 # ── Agent ──────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = textwrap.dedent("""
-    You are a competitive-intelligence analyst for a water delivery company.
+    You are a competitive-intelligence analyst for Vineyard Vines, a premium
+    preppy lifestyle and apparel brand (vineyardvines.com).
 
-    Your goal is to compare discounts and promotional offers between our company
-    (HowestheWater) and the listed competitors.
+    Your goal is to compare discounts and promotional offers between Vineyard Vines
+    and its direct competitors (J.Crew, Lululemon, Bird Dog, Ralph Lauren, etc.).
 
     Process:
-    1. For each site (ours first, then competitors), call find_discount_links to
-       discover promotion or pricing pages.
+    1. For each site (Vineyard Vines first, then competitors), call
+       find_discount_links to discover promotion, sale, or pricing pages.
     2. Call scrape_url on the homepage AND each discovered discount page.
     3. Extract every concrete discount or promotional offer you find:
-       - Percentage discounts (e.g. "20% off first order")
-       - Dollar-off amounts (e.g. "$10 off")
-       - Free trials or free months
-       - Subscription/recurring discounts
+       - Percentage discounts (e.g. "20% off first order", "extra 30% off sale")
+       - Dollar-off amounts (e.g. "$20 off $100")
+       - Welcome / new-customer offers
+       - Email sign-up incentives
+       - Loyalty or rewards programs
        - Referral bonuses
-       - Seasonal or limited-time offers
-       - Bundle deals
-       - New-customer incentives
+       - Seasonal / holiday / flash sales
+       - Clearance or final-sale sections
+       - Free shipping thresholds or offers
+       - Gift-with-purchase deals
+       - Promo codes prominently displayed
     4. After gathering all data, write a clear, structured report with:
-       a. Summary table: site vs. offer types found
-       b. Detailed breakdown per site
-       c. Gap analysis: what competitors offer that we do not
-       d. Actionable recommendations for HowestheWater
+       a. Summary table: brand vs. offer types found (use ✓ / ✗)
+       b. Detailed breakdown per brand with exact offer wording
+       c. Gap analysis — what competitors do that Vineyard Vines does not
+       d. Actionable recommendations for Vineyard Vines
 
     Be thorough — scrape every relevant page you find.
-    If a page fails to load, note it and continue.
+    If a page fails to load, note it and continue with the rest.
     Do NOT fabricate offers; only report what you actually read from the pages.
 """).strip()
 
@@ -252,7 +256,7 @@ def run_agent(our_site: dict, competitors: list[dict], save_report: bool = True)
     ]
 
     print("━" * 64)
-    print(" HowestheWater — Competitor Discount Agent")
+    print(" Vineyard Vines — Competitor Discount Agent")
     print("━" * 64)
 
     final_text = ""
@@ -337,7 +341,7 @@ def run_agent(our_site: dict, competitors: list[dict], save_report: bool = True)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HowestheWater competitor discount agent"
+        description="Vineyard Vines competitor discount agent"
     )
     parser.add_argument(
         "--our-url",
